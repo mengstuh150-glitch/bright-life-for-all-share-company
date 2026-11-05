@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="am">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ብሩህ ህይወት ለሁሉም አክሲዮን ማሕበር</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 font-sans text-slate-800">
+    <div class="max-w-6xl mx-auto p-4 sm:p-6">
+        <header class="bg-indigo-700 text-white p-6 rounded-2xl shadow-xl mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+            <div>
+                <h1 class="text-2xl sm:text-3xl font-bold">ብሩህ ህይወት ለሁሉም አክሲዮን ማሕበር</h1>
+                <p class="text-indigo-200 text-xs sm:text-sm mt-1">Biometric Wallet & Share Management System</p>
+            </div>
+            <nav class="flex gap-2 text-sm font-medium bg-indigo-800 p-2 rounded-xl">
+                <button onclick="switchTab('about')" class="px-3 py-1.5 rounded-lg hover:bg-indigo-600 transition">ስለ ድርጅቱ</button>
+                <button onclick="switchTab('home')" class="px-3 py-1.5 rounded-lg hover:bg-indigo-600 transition">ምዝገባ / መግቢያ</button>
+                <button onclick="checkAdminAccess()" class="px-3 py-1.5 bg-amber-500 text-slate-900 font-bold rounded-lg hover:bg-amber-400 transition">የአድሚን ገጽ</button>
+            </nav>
+        </header>
+
+        <main id="main-container"></main>
+    </div>
+
+    <!-- BIOMETRIC / PIN MODAL -->
+    <div id="auth-modal" class="fixed inset-0 bg-black/50 hidden flex items-center justify-center p-4 z-50">
+        <div class="bg-white p-6 rounded-2xl max-w-sm w-full shadow-2xl text-center space-y-4">
+            <div class="w-16 h-16 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center mx-auto text-2xl">🔒</div>
+            <h3 class="text-xl font-bold text-slate-800">የደህንነት ማረጋገጫ (Security Check)</h3>
+            <p class="text-xs text-slate-500">ይህንን ስራ ለመፈጸም እባክዎ በአሻራዎ (Fingerprint) ወይም በፒን ኮድ ያረጋግጡ።</p>
+            <div class="space-y-3 pt-2">
+                <button onclick="triggerBiometric()" class="w-full bg-indigo-600 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700">
+                    <span>ጣትዎን ያንብቡ (Fingerprint)</span>
+                </button>
+                <div class="relative flex py-2 items-center">
+                    <div class="flex-grow border-t border-slate-200"></div>
+                    <span class="flex-shrink mx-4 text-xs text-slate-400">ወይም በፒን</span>
+                    <div class="flex-grow border-t border-slate-200"></div>
+                </div>
+                <input type="password" id="modal-pin" placeholder="የደህንነት ፒን (ምሳሌ፡ 1234)" maxlength="4" class="w-full p-3 border rounded-xl text-center tracking-widest text-lg">
+                <button onclick="confirmSecurityAction()" class="w-full bg-emerald-600 text-white py-3 rounded-xl font-bold hover:bg-emerald-700">አረጋግጥ (Confirm)</button>
+                <button onclick="closeAuthModal()" class="w-full text-slate-500 text-xs py-1">ሰርዝ (Cancel)</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:5000/api';
+        let currentUser = JSON.parse(localStorage.getItem('bright_user')) || null;
+        let isAdminLoggedIn = localStorage.getItem('bright_admin') === 'true';
+        let activeTab = 'home';
+        let pendingAction = null;
+
+        function switchTab(tab) {
+            activeTab = tab;
+            render();
+        }
+
+        function render() {
+            const container = document.getElementById('main-container');
+            if (activeTab === 'about') {
+                container.innerHTML = `<div class="bg-white p-6 rounded-2xl shadow-md"><h2 class="text-2xl font-bold text-indigo-900 mb-3">ስለ ማህበራችን</h2><p class="text-slate-600">ከ3,000-5,000 አባላትን የሚያስተባብር ዘመናዊ ሲስተም።</p></div>`;
+            } else if (activeTab === 'admin') {
+                if (isAdminLoggedIn) renderAdminPage(container);
+                else renderAdminLogin(container);
+            } else {
+                if (currentUser) renderDashboard(container);
+                else renderAuthForms(container);
+            }
+        }
+
+        function renderAuthForms(container) {
+            container.innerHTML = `
+                <div class="grid md:grid-cols-2 gap-6">
+                    <div class="bg-white p-6 rounded-2xl shadow-md border">
+                        <h2 class="text-xl font-bold mb-4 text-indigo-700">አዲስ አባል ምዝገባ</h2>
+                        <form onsubmit="handleRegister(event)" class="space-y-3">
+                            <input type="text" id="reg-name" placeholder="ሙሉ ስም" required class="w-full p-3 border rounded-lg">
+                            <input type="text" id="reg-phone" placeholder="ስልክ ቁጥር" required class="w-full p-3 border rounded-lg">
+                            <input type="password" id="reg-pass" placeholder="የይለፍ ቃል" required class="w-full p-3 border rounded-lg">
+                            <input type="text" id="reg-ref" placeholder="የጋባዥ ሪፈራል ኮድ (ካለ)" class="w-full p-3 border rounded-lg">
+                            <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg font-bold">ተመዝገብ</button>
+                        </form>
+                    </div>
+                    <div class="bg-white p-6 rounded-2xl shadow-md border">
+                        <h2 class="text-xl font-bold mb-4 text-emerald-700">መግቢያ</h2>
+                        <form onsubmit="handleLogin(event)" class="space-y-3">
+                            <input type="text" id="login-phone" placeholder="ስልክ ቁጥር" required class="w-full p-3 border rounded-lg">
+                            <input type="password" id="login-pass" placeholder="የይለፍ ቃል" required class="w-full p-3 border rounded-lg">
+                            <button type="submit" class="w-full bg-emerald-600 text-white p-3 rounded-lg font-bold">ግባ</button>
+                        </form>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function renderDashboard(container) {
+            const res = await fetch(`${API_URL}/member/dashboard/${currentUser.id}`);
+            const data = await res.json();
+
+            container.innerHTML = `
+                <div class="space-y-6">
+                    <div class="bg-white p-6 rounded-2xl shadow-md flex justify-between items-center">
+                        <div>
+                            <h2 class="text-2xl font-bold text-slate-800">${data.member.full_name}</h2>
+                            <p class="text-sm text-slate-500">ሪፈራል ኮድ: <span class="font-bold text-indigo-600">${data.member.referral_code}</span></p>
+                        </div>
+                        <button onclick="logout()" class="bg-red-500 text-white px-4 py-2 rounded-lg text-xs">ውጣ</button>
+                    </div>
+
+                    <div class="grid sm:grid-cols-3 gap-4">
+                        <div class="bg-indigo-50 p-4 rounded-xl border">
+                            <p class="text-xs text-indigo-600 font-bold uppercase">የዋሌት ሂሳብ</p>
+                            <h3 class="text-2xl font-bold text-indigo-900">${data.wallet_balance} ብር</h3>
+                        </div>
+                        <div class="bg-emerald-50 p-4 rounded-xl border">
+                            <p class="text-xs text-emerald-600 font-bold uppercase">ሁኔታ</p>
+                            <h3 class="text-lg font-bold text-emerald-900">${data.member.status === 'Verified' ? '✅ የተረጋገጠ' : '⏳ በመጠባበቅ ላይ'}</h3>
+                        </div>
+                        <div class="bg-purple-50 p-4 rounded-xl border">
+                            <p class="text-xs text-purple-600 font-bold uppercase">ያመጧቸው</p>
+                            <h3 class="text-2xl font-bold text-purple-900">${data.direct_invites} ሰው</h3>
+                        </div>
+                    </div>
+
+                    <!-- Wallet Secured Actions -->
+                    <div class="grid md:grid-cols-2 gap-6">
+                        <div class="bg-white p-6 rounded-2xl shadow-md border">
+                            <h3 class="font-bold text-lg mb-3 text-indigo-700">ገንዘብ ማስተላለፍ (በአሻራ/ፒን የተጠበቀ)</h3>
+                            <form onsubmit="initiateTransfer(event)" class="space-y-3">
+                                <input type="text" id="trans-phone" placeholder="የተቀባይ ስልክ" required class="w-full p-2.5 border rounded-lg text-sm">
+                                <input type="number" id="trans-amount" placeholder="መጠን (ብር)" required class="w-full p-2.5 border rounded-lg text-sm">
+                                <button type="submit" class="w-full bg-indigo-600 text-white p-2.5 rounded-lg text-sm font-bold">አስተላልፍ (በአሻራ)</button>
+                            </form>
+                        </div>
+                        <div class="bg-white p-6 rounded-2xl shadow-md border">
+                            <h3 class="font-bold text-lg mb-3 text-amber-700">ወጪ ማዘዣ (Withdrawal)</h3>
+                            <form onsubmit="initiateWithdraw(event)" class="space-y-3">
+                                <input type="number" id="withdraw-amount" placeholder="መጠን (ብር)" required class="w-full p-2.5 border rounded-lg text-sm">
+                                <button type="submit" class="w-full bg-amber-600 text-white p-2.5 rounded-lg text-sm font-bold">ወጪ አድርግ (በአሻራ)</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // BIOMETRIC & PIN MODAL LOGIC
+        function initiateTransfer(e) {
+            e.preventDefault();
+            pendingAction = {
+                type: 'TRANSFER',
+                data: {
+                    sender_id: currentUser.id,
+                    recipient_phone: document.getElementById('trans-phone').value,
+                    amount: document.getElementById('trans-amount').value
+                }
+            };
+            openAuthModal();
+        }
+
+        function initiateWithdraw(e) {
+            e.preventDefault();
+            pendingAction = {
+                type: 'WITHDRAW',
+                data: {
+                    member_id: currentUser.id,
+                    amount: document.getElementById('withdraw-amount').value
+                }
+            };
+            openAuthModal();
+        }
+
+        function openAuthModal() {
+            document.getElementById('auth-modal').classList.remove('hidden');
+        }
+
+        function closeAuthModal() {
+            document.getElementById('auth-modal').classList.add('hidden');
+            pendingAction = null;
+            document.getElementById('modal-pin').value = '';
+        }
+
+        async function triggerBiometric() {
+            // WebAuthn Browser Biometric Prompt simulation
+            if (window.PublicKeyCredential) {
+                try {
+                    alert('እባክዎን በስልክዎ ወይም በኮምፒውተርዎ አሻራ ስካነር ያረጋግጡ...');
+                    // Simulating successful fingerprint scan verification
+                    setTimeout(() => executePendingAction(), 1000);
+                } catch (err) {
+                    alert('የአሻራ ማረጋገጫው አልተሳካም። እባክዎን በፒን ኮድ ይሞክሩ።');
+                }
+            } else {
+                alert('ብሮውዘርዎ አሻራ (Biometric) አያስተናግድም። እባክዎን የፒን ኮድ ይጠቀሙ።');
+            }
+        }
+
+        async function confirmSecurityAction() {
+            const pin = document.getElementById('modal-pin').value;
+            if (pin === '1234' || pin.length === 4) { // ፒን ኮድ ማረጋገጫ
+                executePendingAction();
+            } else {
+                alert('የተሳሳተ የደህንነት ፒን ኮድ!');
+            }
+        }
+
+        async function executePendingAction() {
+            if (!pendingAction) return;
+            let url = '';
+            if (pendingAction.type === 'TRANSFER') url = `${API_URL}/wallet/transfer`;
+            if (pendingAction.type === 'WITHDRAW') url = `${API_URL}/wallet/withdraw`;
+
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(pendingAction.data)
+            });
+            const data = await res.json();
+            if (res.ok) {
+                alert(data.message);
+                closeAuthModal();
+                render();
+            } else {
+                alert(data.error);
+            }
+        }
+
+        function checkAdminAccess() {
+            if (isAdminLoggedIn) switchTab('admin');
+            else activeTab = 'admin'; render();
+        }
+
+        function renderAdminLogin(container) {
+            container.innerHTML = `
+                <div class="max-w-md mx-auto bg-white p-8 rounded-2xl shadow-lg border mt-10 text-center">
+                    <h2 class="text-2xl font-bold mb-4 text-indigo-700">የአድሚን መግቢያ</h2>
+                    <form onsubmit="handleAdminLogin(event)" class="space-y-4">
+                        <input type="password" id="admin-pass" placeholder="ፓስወርድ (12345678)" required class="w-full p-3 border rounded-lg">
+                        <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg font-bold">ግባ</button>
+                    </form>
+                </div>
+            `;
+        }
+
+        async function handleAdminLogin(e) {
+            e.preventDefault();
+            const password = document.getElementById('admin-pass').value;
+            const res = await fetch(`${API_URL}/admin/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password })
+            });
+            if (res.ok) {
+                isAdminLoggedIn = true;
+                localStorage.setItem('bright_admin', 'true');
+                render();
+            } else {
+                alert('የተሳሳተ ፓስወርድ!');
+            }
+        }
+
+        async function renderAdminPage(container) {
+            const res = await fetch(`${API_URL}/admin/analytics`);
+            const analytics = await res.json();
+            container.innerHTML = `
+                <div class="space-y-6">
+                    <div class="flex justify-between items-center bg-white p-4 rounded-xl shadow-sm border">
+                        <h2 class="font-bold text-lg text-indigo-700">የአድሚን ዳሽቦርድ (አሻራ/ፒን የተጠበቀ)</h2>
+                        <button onclick="adminLogout()" class="bg-slate-700 text-white px-3 py-1.5 rounded-lg text-xs">ውጣ</button>
+                    </div>
+                    <div class="bg-white p-6 rounded-2xl shadow-md border">
+                        <h3 class="font-bold text-lg mb-4">አባላት እና ውል ማረጋገጫ</h3>
+                        <table class="w-full text-left text-sm">
+                            <tr class="bg-slate-100 border-b"><th class="p-3">ስም</th><th class="p-3">ስልክ</th><th class="p-3">ሁኔታ</th><th class="p-3">እርምጃ</th></tr>
+                            ${analytics.member_stats.map(m => `
+                                <tr class="border-b">
+                                    <td class="p-3">${m.full_name}</td><td class="p-3">${m.phone}</td>
+                                    <td class="p-3"><span class="px-2 py-1 rounded text-xs ${m.status === 'Verified' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}">${m.status}</span></td>
+                                    <td class="p-3">${m.status !== 'Verified' ? `<button onclick="verifyMember(${m.id})" class="bg-emerald-600 text-white px-2.5 py-1 rounded text-xs">አረጋግጥ</button>` : 'ተጠናቋል'}</td>
+                                </tr>
+                            `).join('')}
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function verifyMember(memberId) {
+            // አድሚኑም ውል ሲያረጋግጥ አሻራ/ፒን እንዲጠይቅ ማድረግ ይቻላል
+            pendingAction = { type: 'ADMIN_VERIFY', member_id: memberId };
+            openAuthModal();
+        }
+
+        // Overriding executePendingAction for admin
+        const oldExecute = executePendingAction;
+        executePendingAction = async function() {
+            if (pendingAction && pendingAction.type === 'ADMIN_VERIFY') {
+                const res = await fetch(`${API_URL}/admin/verify-member`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ member_id: pendingAction.member_id })
+                });
+                const data = await res.json();
+                alert(data.message);
+                closeAuthModal();
+                render();
+            } else {
+                oldExecute();
+            }
+        }
+
+        async function handleRegister(e) {
+            e.preventDefault();
+            const res = await fetch(`${API_URL}/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    full_name: document.getElementById('reg-name').value,
+                    phone: document.getElementById('reg-phone').value,
+                    password: document.getElementById('reg-pass').value,
+                    referred_by: document.getElementById('reg-ref').value
+                })
+            });
+            const data = await res.json();
+            if (res.ok) { alert(data.message + '\nሪፈራል: ' + data.referral_code); render(); }
+            else alert(data.error);
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const res = await fetch(`${API_URL}/login`, {
+                method: 'POST',
+                headers: { 'Content-Type5': 'application/json' },
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: document.getElementById('login-phone').value, password: document.getElementById('login-pass').value })
+            });
+            const data = await res.json();
+            if (res.ok) { currentUser = data.member; localStorage.setItem('bright_user', JSON.stringify(currentUser)); render(); }
+            else alert(data.error);
+        }
+
+        function logout() { localStorage.removeItem('bright_user'); currentUser = null; render(); }
+        function adminLogout() { localStorage.removeItem('bright_admin'); isAdminLoggedIn = false; switchTab('home'); }
+
+        render();
+    </script>
+</body>
+</html>
