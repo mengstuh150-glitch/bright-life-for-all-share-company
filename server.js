@@ -21,7 +21,7 @@ db.exec(`
     full_name TEXT NOT NULL,
     phone TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
-    pin_code TEXT DEFAULT '1234', -- ለዋሌት እና ለአሻራ ምትክ የሚሆን ፒን
+    pin_code TEXT DEFAULT '1234',
     referral_code TEXT UNIQUE NOT NULL,
     referred_by TEXT,
     status TEXT DEFAULT 'Pending',
@@ -80,11 +80,11 @@ db.exec(`
   );
 `);
 
-// Initialize Default Admin
+// Initialize Default Admin (Fixed SQL Syntax Error here)
 const adminRow = db.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
 if (!adminRow) {
   const defaultPassHash = bcrypt.hashSync('12345678', 10);
-  db.prepare('INSERT INTO admin_settings (id, password_hash, pin_code) VALUES (1, ?, '1234')').run(defaultPassHash);
+  db.prepare('INSERT INTO admin_settings (id, password_hash, pin_code) VALUES (1, ?, ?)').run(defaultPassHash, '1234');
 }
 
 // Initialize Default Products
@@ -107,7 +107,7 @@ function sendSMS(phone, message) {
   return true;
 }
 
-// --- API ENDPORTS ---
+// --- API ENDPOINTS ---
 
 app.post('/api/register', async (req, res) => {
   const { full_name, phone, password, referred_by } = req.body;
@@ -167,31 +167,42 @@ app.post('/api/admin/verify-member', (req, res) => {
   if (!member) return res.status(404).json({ error: 'አባል አልተገኘም።' });
   if (member.status === 'Verified') return res.status(400).json({ error: 'አስቀድሞ ተረጋግጧል።' });
 
-  db.prepare("UPDATE members SET status = 'Verified' WHERE id = ?").run(member_id);
+  // Use transaction to ensure data integrity for payouts
+  const verifyAndUpdate = db.transaction((mId) => {
+    db.prepare("UPDATE members SET status = 'Verified' WHERE id = ?").run(mId);
 
-  const payouts = [500, 300, 100];
-  let currentReferrerCode = member.referred_by;
+    const payouts = [500, 300, 100];
+    let currentReferrerCode = member.referred_by;
 
-  for (let tier = 1; tier <= 3; tier++) {
-    if (!currentReferrerCode) break;
-    const referrer = db.prepare('SELECT * FROM members WHERE referral_code = ?').get(currentReferrerCode);
-    if (!referrer) break;
+    for (let tier = 1; tier <= 3; tier++) {
+      if (!currentReferrerCode) break;
+      const referrer = db.prepare('SELECT * FROM members WHERE referral_code = ?').get(currentReferrerCode);
+      if (!referrer) break;
 
-    const payoutAmount = payouts[tier - 1];
-    db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(payoutAmount, referrer.id);
-    db.prepare(`
-      INSERT INTO referral_payouts (beneficiary_id, source_member_id, tier, amount)
-      VALUES (?, ?, ?, ?)
-    `).run(referrer.id, member.id, tier, payoutAmount);
-    currentReferrerCode = referrer.referred_by;
+      const payoutAmount = payouts[tier - 1];
+      db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(payoutAmount, referrer.id);
+      db.prepare(`
+        INSERT INTO referral_payouts (beneficiary_id, source_member_id, tier, amount)
+        VALUES (?, ?, ?, ?)
+      `).run(referrer.id, member.id, tier, payoutAmount);
+      
+      currentReferrerCode = referrer.referred_by;
+    }
+  });
+
+  try {
+    verifyAndUpdate(member_id);
+    res.json({ message: 'አባሉ ተረጋግጧል፤ የሪፈራል ክፍያውም ተፈጽሟል።' });
+  } catch (err) {
+    res.status(500).json({ error: 'ማረጋገጥ ላይ ስህተት አጋጥሟል: ' + err.message });
   }
-
-  res.json({ message: 'አባሉ ተረጋግጧል፤ የሪፈራል ክፍያውም ተፈጽሟል።' });
 });
 
 app.get('/api/member/dashboard/:id', (req, res) => {
   const memberId = req.params.id;
   const member = db.prepare('SELECT id, full_name, phone, referral_code, status, created_at FROM members WHERE id = ?').get(memberId);
+  if (!member) return res.status(404).json({ error: 'አባል አልተገኘም።' });
+
   const wallet = db.prepare('SELECT balance FROM wallets WHERE member_id = ?').get(memberId);
   const directInvites = db.prepare('SELECT COUNT(*) as count FROM members WHERE referred_by = ?').get(member.referral_code);
   const payouts = db.prepare('SELECT rp.*, m.full_name as source_name FROM referral_payouts rp JOIN members m ON rp.source_member_id = m.id WHERE rp.beneficiary_id = ?').all(memberId);
@@ -204,16 +215,40 @@ app.post('/api/wallet/transfer', (req, res) => {
   const { sender_id, recipient_phone, amount } = req.body;
   const transferAmount = parseFloat(amount);
 
-  const senderWallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(sender_id);
-  if (!senderWallet || senderWallet.balance < transferAmount) return res.status(400).json({ error: 'በቂ ገንዘብ የለም።' });
+  if (isNaN(transferAmount) || transferAmount <= 0) {
+    return res.status(400).json({ error: 'ትክክለኛ ያልሆነ የገንዘብ መጠን።' });
+  }
 
-  const recipient = db.prepare('SELECT * FROM members WHERE phone = ?').get(recipient_phone);
-  if (!recipient) return res.status(404).json({ error: 'ተቀባዩ አልተገኘም።' });
+  const transferAction = db.transaction(() => {
+    const senderWallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(sender_id);
+    if (!senderWallet || senderWallet.balance < transferAmount) {
+      throw new Error('በቂ ገንዘብ የለም።');
+    }
 
-  db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(transferAmount, sender_id);
-  db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(transferAmount, recipient.id);
+    const recipient = db.prepare('SELECT * FROM members WHERE phone = ?').get(recipient_phone);
+    if (!recipient) {
+      throw new Error('ተቀባዩ አልተገኘም።');
+    }
 
-  res.json({ message: 'ገንዘብ ማስተላለፉ ተሳክቷል!' });
+    if (senderWallet.member_id === recipient.id) {
+      throw new Error('ለራስዎ ገንዘብ ማስተላለፍ አይችሉም።');
+    }
+
+    db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(transferAmount, sender_id);
+    db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(transferAmount, recipient.id);
+    
+    db.prepare(`
+      INSERT INTO transactions (sender_id, receiver_id, type, amount, description)
+      VALUES (?, ?, 'TRANSFER', ?, 'Wallet to Wallet Transfer')
+    `).run(sender_id, recipient.id, transferAmount);
+  });
+
+  try {
+    transferAction();
+    res.json({ message: 'ገንዘብ ማስተላለፉ ተሳክቷል!' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.post('/api/wallet/withdraw', (req, res) => {
@@ -230,8 +265,9 @@ app.post('/api/wallet/withdraw', (req, res) => {
 app.post('/api/store/buy', (req, res) => {
   const { member_id, product_id } = req.body;
   const product = db.prepare('SELECT * FROM products WHERE id = ?').get(product_id);
-  const wallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(member_id);
+  if (!product) return res.status(404).json({ error: 'እቃው አልተገኘም።' });
 
+  const wallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(member_id);
   if (!wallet || wallet.balance < product.price) return res.status(400).json({ error: 'በቂ ገንዘብ የለም።' });
 
   db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(product.price, member_id);
