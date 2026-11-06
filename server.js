@@ -4,15 +4,35 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
 const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
 require('dotenv').config();
 
 const app = express();
+
+// --- PRODUCTION SECURITY MIDDLEWARES ---
+app.use(helmet());
 app.use(express.json());
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const JWT_SECRET = process.env.JWT_SECRET || 'bright_life_secret_key_2026';
+// Rate limiter for authentication routes to prevent brute-force attacks
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // limit each IP to 20 requests per windowMs
+  message: { error: 'እጅግ በጣም ብዙ ሙከራዎች ተደርገዋል፤ እባክዎ ከ15 ደቂቃ በኋላ እንደገና ይሞክሩ።' }
+});
+
+app.use('/api/login', authLimiter);
+app.use('/api/register', authLimiter);
+app.use('/api/admin/login', authLimiter);
+
+const JWT_SECRET = process.env.JWT_SECRET || 'bright_life_secret_key_2026_secure';
 const db = new Database('bright_life.db');
+
+// Enable WAL mode for high concurrency
+db.pragma('journal_mode = WAL');
 
 // --- DATABASE TABLES CREATION ---
 db.exec(`
@@ -80,10 +100,10 @@ db.exec(`
   );
 `);
 
-// Initialize Default Admin (Fixed SQL Syntax Error here)
+// Initialize Default Admin
 const adminRow = db.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
 if (!adminRow) {
-  const defaultPassHash = bcrypt.hashSync('12345678', 10);
+  const defaultPassHash = bcrypt.hashSync('BrightLifeAdmin@2026!', 10);
   db.prepare('INSERT INTO admin_settings (id, password_hash, pin_code) VALUES (1, ?, ?)').run(defaultPassHash, '1234');
 }
 
@@ -107,13 +127,36 @@ function sendSMS(phone, message) {
   return true;
 }
 
+// Admin Token Verification Middleware
+function verifyAdminToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'ዕውቅና የለውም (Token አልተገኘም)' });
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err || !user.isAdmin) return res.status(403).json({ error: 'ይህንን ማከናወን ፈቃድ የሎትም!' });
+    req.admin = user;
+    next();
+  });
+}
+
+// Input Validation Error Handler Middleware
+function handleValidationErrors(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: errors.array()[0].msg });
+  }
+  next();
+}
+
 // --- API ENDPOINTS ---
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', [
+  body('full_name').trim().notEmpty().withMessage('ስም መሞላት አለበት'),
+  body('phone').trim().notEmpty().withMessage('ስልክ ቁጥር መሞላት አለበት'),
+  body('password').isLength({ min: 6 }).withMessage('የይለፍ ቃል ቢያንስ 6 ሆሄያት መሆን አለበት')
+], handleValidationErrors, async (req, res, next) => {
   const { full_name, phone, password, referred_by } = req.body;
-  if (!full_name || !phone || !password) {
-    return res.status(400).json({ error: 'እባክዎን ሁሉንም አስፈላጊ መረጃዎች ያስገቡ።' });
-  }
 
   try {
     const existing = db.prepare('SELECT * FROM members WHERE phone = ?').get(phone);
@@ -123,22 +166,29 @@ app.post('/api/register', async (req, res) => {
     const myReferralCode = generateReferralCode(full_name);
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    const insert = db.prepare(`
-      INSERT INTO members (full_name, phone, password, referral_code, referred_by, otp_code)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    const result = insert.run(full_name, phone, hashedPassword, myReferralCode, referred_by || null, otp);
+    const registerTransaction = db.transaction(() => {
+      const insert = db.prepare(`
+        INSERT INTO members (full_name, phone, password, referral_code, referred_by, otp_code)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      const result = insert.run(full_name, phone, hashedPassword, myReferralCode, referred_by || null, otp);
+      db.prepare('INSERT INTO wallets (member_id, balance) VALUES (?, 0.0)').run(result.lastInsertRowid);
+      return result.lastInsertRowid;
+    });
 
-    db.prepare('INSERT INTO wallets (member_id, balance) VALUES (?, 0.0)').run(result.lastInsertRowid);
+    const newMemberId = registerTransaction();
     sendSMS(phone, `የብሩህ ህይወት ማህበር የማረጋገጫ ኮድዎ: ${otp}`);
 
-    res.status(201).json({ message: 'ምዝገባው ተሳክቷል!', member_id: result.lastInsertRowid, referral_code: myReferralCode });
+    res.status(201).json({ message: 'ምዝገባው ተሳክቷል!', member_id: newMemberId, referral_code: myReferralCode });
   } catch (err) {
-    res.status(500).json({ error: 'የሲስተም ስህተት: ' + err.message });
+    next(err);
   }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', [
+  body('phone').trim().notEmpty().withMessage('ስልክ ቁጥር ያስገቡ'),
+  body('password').notEmpty().withMessage('የይለፍ ቃል ያስገቡ')
+], handleValidationErrors, async (req, res, next) => {
   const { phone, password } = req.body;
   const member = db.prepare('SELECT * FROM members WHERE phone = ?').get(phone);
 
@@ -146,55 +196,68 @@ app.post('/api/login', async (req, res) => {
     return res.status(401).json({ error: 'የተሳሳተ የስልክ ቁጥር ወይም የይለፍ ቃል::' });
   }
 
-  const token = jwt.sign({ id: member.id, phone: member.phone }, JWT_SECRET, { expiresIn: '7d' });
+  const token = jwt.sign({ id: member.id, phone: member.phone, isAdmin: false }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, member: { id: member.id, full_name: member.full_name, referral_code: member.referral_code, status: member.status } });
 });
 
-app.post('/api/admin/login', async (req, res) => {
+app.post('/api/admin/login', [
+  body('password').notEmpty().withMessage('የአድሚን የይለፍ ቃል ያስገቡ')
+], handleValidationErrors, async (req, res, next) => {
   const { password } = req.body;
   const admin = db.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
   
-  if (await bcrypt.compare(password, admin.password_hash)) {
-    res.json({ success: true, message: 'የአድሚን መግቢያ ተሳክቷል!' });
+  if (admin && (await bcrypt.compare(password, admin.password_hash))) {
+    const token = jwt.sign({ isAdmin: true }, JWT_SECRET, { expiresIn: '1d' });
+    res.json({ success: true, token, message: 'የአድሚን መግቢያ ተሳክቷል!' });
   } else {
     res.status(401).json({ error: 'የተሳሳተ የአድሚን የይለፍ ቃል!' });
   }
 });
 
-app.post('/api/admin/verify-member', (req, res) => {
+// Admin Verify Member with Payouts & Transaction Logging
+app.post('/api/admin/verify-member', verifyAdminToken, [
+  body('member_id').isInt().withMessage('ትክክለኛ የአባል መለያ (ID) ያስገቡ')
+], handleValidationErrors, (req, res) => {
   const { member_id } = req.body;
-  const member = db.prepare('SELECT * FROM members WHERE id = ?').get(member_id);
-  if (!member) return res.status(404).json({ error: 'አባል አልተገኘም።' });
-  if (member.status === 'Verified') return res.status(400).json({ error: 'አስቀድሞ ተረጋግጧል።' });
-
-  // Use transaction to ensure data integrity for payouts
-  const verifyAndUpdate = db.transaction((mId) => {
-    db.prepare("UPDATE members SET status = 'Verified' WHERE id = ?").run(mId);
-
-    const payouts = [500, 300, 100];
-    let currentReferrerCode = member.referred_by;
-
-    for (let tier = 1; tier <= 3; tier++) {
-      if (!currentReferrerCode) break;
-      const referrer = db.prepare('SELECT * FROM members WHERE referral_code = ?').get(currentReferrerCode);
-      if (!referrer) break;
-
-      const payoutAmount = payouts[tier - 1];
-      db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(payoutAmount, referrer.id);
-      db.prepare(`
-        INSERT INTO referral_payouts (beneficiary_id, source_member_id, tier, amount)
-        VALUES (?, ?, ?, ?)
-      `).run(referrer.id, member.id, tier, payoutAmount);
-      
-      currentReferrerCode = referrer.referred_by;
-    }
-  });
-
+  
   try {
-    verifyAndUpdate(member_id);
+    const verifyTransaction = db.transaction(() => {
+      const member = db.prepare('SELECT * FROM members WHERE id = ?').get(member_id);
+      if (!member) throw new Error('አባል አልተገኘም።');
+      if (member.status === 'Verified') throw new Error('አስቀድሞ ተረጋግጧል።');
+
+      db.prepare("UPDATE members SET status = 'Verified' WHERE id = ?").run(member_id);
+
+      const payouts = [500, 300, 100];
+      let currentReferrerCode = member.referred_by;
+
+      for (let tier = 1; tier <= 3; tier++) {
+        if (!currentReferrerCode) break;
+        const referrer = db.prepare('SELECT * FROM members WHERE referral_code = ?').get(currentReferrerCode);
+        if (!referrer) break;
+
+        const payoutAmount = payouts[tier - 1];
+        db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(payoutAmount, referrer.id);
+        
+        db.prepare(`
+          INSERT INTO referral_payouts (beneficiary_id, source_member_id, tier, amount)
+          VALUES (?, ?, ?, ?)
+        `).run(referrer.id, member.id, tier, payoutAmount);
+
+        // Log transaction
+        db.prepare(`
+          INSERT INTO transactions (sender_id, receiver_id, type, amount, description)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(member.id, referrer.id, 'REFERRAL_COMMISSION', payoutAmount, `Tier ${tier} commission from ${member.full_name}`);
+
+        currentReferrerCode = referrer.referred_by;
+      }
+    });
+
+    verifyTransaction();
     res.json({ message: 'አባሉ ተረጋግጧል፤ የሪፈራል ክፍያውም ተፈጽሟል።' });
   } catch (err) {
-    res.status(500).json({ error: 'ማረጋገጥ ላይ ስህተት አጋጥሟል: ' + err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
@@ -211,40 +274,50 @@ app.get('/api/member/dashboard/:id', (req, res) => {
   res.json({ member, wallet_balance: wallet ? wallet.balance : 0, direct_invites: directInvites.count, payouts, products });
 });
 
-app.post('/api/wallet/transfer', (req, res) => {
+// New Endpoint for Member Transaction History
+app.get('/api/member/transactions/:id', (req, res) => {
+  const memberId = req.params.id;
+  const transactions = db.prepare(`
+    SELECT * FROM transactions 
+    WHERE sender_id = ? OR receiver_id = ? 
+    ORDER BY created_at DESC
+  `).all(memberId, memberId);
+
+  res.json({ transactions });
+});
+
+app.post('/api/wallet/transfer', [
+  body('sender_id').notEmpty(),
+  body('recipient_phone').trim().notEmpty(),
+  body('amount').isNumeric().withMessage('ትክክለኛ መጠን ያስገቡ')
+], handleValidationErrors, (req, res) => {
   const { sender_id, recipient_phone, amount } = req.body;
   const transferAmount = parseFloat(amount);
 
-  if (isNaN(transferAmount) || transferAmount <= 0) {
-    return res.status(400).json({ error: 'ትክክለኛ ያልሆነ የገንዘብ መጠን።' });
+  if (transferAmount <= 0) {
+    return res.status(400).json({ error: 'እባክዎን ከዜሮ በላይ የሆነ መጠን ያስገቡ።' });
   }
 
-  const transferAction = db.transaction(() => {
-    const senderWallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(sender_id);
-    if (!senderWallet || senderWallet.balance < transferAmount) {
-      throw new Error('በቂ ገንዘብ የለም።');
-    }
-
-    const recipient = db.prepare('SELECT * FROM members WHERE phone = ?').get(recipient_phone);
-    if (!recipient) {
-      throw new Error('ተቀባዩ አልተገኘም።');
-    }
-
-    if (senderWallet.member_id === recipient.id) {
-      throw new Error('ለራስዎ ገንዘብ ማስተላለፍ አይችሉም።');
-    }
-
-    db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(transferAmount, sender_id);
-    db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(transferAmount, recipient.id);
-    
-    db.prepare(`
-      INSERT INTO transactions (sender_id, receiver_id, type, amount, description)
-      VALUES (?, ?, 'TRANSFER', ?, 'Wallet to Wallet Transfer')
-    `).run(sender_id, recipient.id, transferAmount);
-  });
-
   try {
-    transferAction();
+    const transferTx = db.transaction(() => {
+      const senderWallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(sender_id);
+      if (!senderWallet || senderWallet.balance < transferAmount) throw new Error('በቂ ገንዘብ የለም።');
+
+      const recipient = db.prepare('SELECT * FROM members WHERE phone = ?').get(recipient_phone);
+      if (!recipient) throw new Error('ተቀባዩ አልተገኘም።');
+      if (senderWallet.member_id === recipient.id) throw new Error('ለራስዎ ገንዘብ ማስተላለፍ አይችሉም።');
+
+      db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(transferAmount, sender_id);
+      db.prepare('UPDATE wallets SET balance = balance + ? WHERE member_id = ?').run(transferAmount, recipient.id);
+
+      // Log transaction
+      db.prepare(`
+        INSERT INTO transactions (sender_id, receiver_id, type, amount, description)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(sender_id, recipient.id, 'TRANSFER', transferAmount, `Transfer to phone ${recipient_phone}`);
+    });
+
+    transferTx();
     res.json({ message: 'ገንዘብ ማስተላለፉ ተሳክቷል!' });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -255,26 +328,59 @@ app.post('/api/wallet/withdraw', (req, res) => {
   const { member_id, amount } = req.body;
   const withdrawAmount = parseFloat(amount);
 
-  const wallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(member_id);
-  if (!wallet || wallet.balance < withdrawAmount) return res.status(400).json({ error: 'በቂ ቀሪ ሂሳብ የለም።' });
+  if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
+    return res.status(400).json({ error: 'እባክዎን ትክክለኛ መጠን ያስገቡ።' });
+  }
 
-  db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(withdrawAmount, member_id);
-  res.json({ message: 'የወጪ ማዘዣ ጥያቄዎ ተቀባይነት አግኝቷል!' });
+  try {
+    const withdrawTx = db.transaction(() => {
+      const wallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(member_id);
+      if (!wallet || wallet.balance < withdrawAmount) throw new Error('በቂ ቀሪ ሂሳብ የለም።');
+
+      db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(withdrawAmount, member_id);
+
+      // Log transaction
+      db.prepare(`
+        INSERT INTO transactions (sender_id, receiver_id, type, amount, description)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(member_id, null, 'WITHDRAWAL', withdrawAmount, 'Withdrawal request');
+    });
+
+    withdrawTx();
+    res.json({ message: 'የወጪ ማዘዣ ጥያቄዎ ተቀባይነት አግኝቷል!' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.post('/api/store/buy', (req, res) => {
   const { member_id, product_id } = req.body;
-  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(product_id);
-  if (!product) return res.status(404).json({ error: 'እቃው አልተገኘም።' });
+  
+  try {
+    const buyTx = db.transaction(() => {
+      const product = db.prepare('SELECT * FROM products WHERE id = ?').get(product_id);
+      if (!product) throw new Error('ምርቱ አልተገኘም።');
 
-  const wallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(member_id);
-  if (!wallet || wallet.balance < product.price) return res.status(400).json({ error: 'በቂ ገንዘብ የለም።' });
+      const wallet = db.prepare('SELECT * FROM wallets WHERE member_id = ?').get(member_id);
+      if (!wallet || wallet.balance < product.price) throw new Error('በቂ ገንዘብ የለም።');
 
-  db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(product.price, member_id);
-  res.json({ message: `"${product.name}" እቃውን በተሳካ ሁኔታ ገዝተዋል!` });
+      db.prepare('UPDATE wallets SET balance = balance - ? WHERE member_id = ?').run(product.price, member_id);
+
+      // Log transaction
+      db.prepare(`
+        INSERT INTO transactions (sender_id, receiver_id, type, amount, description)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(member_id, null, 'PURCHASE', product.price, `Bought product: ${product.name}`);
+    });
+
+    buyTx();
+    res.json({ message: `እቃውን በተሳካ ሁኔታ ገዝተዋል!` });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.get('/api/admin/analytics', (req, res) => {
+app.get('/api/admin/analytics', verifyAdminToken, (req, res) => {
   const totalMembers = db.prepare('SELECT COUNT(*) as count FROM members').get().count;
   const verifiedMembers = db.prepare("SELECT COUNT(*) as count FROM members WHERE status = 'Verified'").get().count;
   const totalPayouts = db.prepare('SELECT SUM(amount) as total FROM referral_payouts').get().total || 0;
@@ -286,4 +392,8 @@ app.get('/api/admin/analytics', (req, res) => {
   res.json({ total_members: totalMembers, verified_members: verifiedMembers, total_payouts: totalPayouts, total_registration_collected: verifiedMembers * 1400, member_stats: memberStats });
 });
 
-app.listen(5000, () => console.log('Server running on port 5000'));
+// Render Port Configuration
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Production server is running securely on port ${PORT}`);
+});
